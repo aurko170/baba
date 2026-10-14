@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart' show rootBundle;
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -71,8 +72,9 @@ class _AppEntryScreenState extends State<AppEntryScreen> {
     if (!mounted) return;
     setState(() {mode = prefs.getString('baby_mode'); date = value == null ? null : DateTime.tryParse(value); loading = false;});
     if (mode != null && date != null) {
-      await BabyNotificationService.instance.initialize();
-      await BabyNotificationService.instance.reschedule();
+      unawaited(BabyNotificationService.instance.reschedule().catchError((Object error) {
+        debugPrint('Notification scheduling failed: $error');
+      }));
     }
   }
   Future<void> _setDate() async {
@@ -83,11 +85,18 @@ class _AppEntryScreenState extends State<AppEntryScreen> {
   Future<void> _save() async {
     if (date == null || mode == null) return;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('baby_mode', mode!);
-    await prefs.setString('baby_date', date!.toIso8601String());
-    await BabyNotificationService.instance.initialize();
-    await BabyNotificationService.instance.reschedule();
+    final modeSaved = await prefs.setString('baby_mode', mode!);
+    final dateSaved = await prefs.setString('baby_date', date!.toIso8601String());
+    if (!modeSaved || !dateSaved) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('তারিখ সংরক্ষণ করা যায়নি। আবার চেষ্টা করুন।')));
+      return;
+    }
+    // Navigate immediately; notification permissions and scheduling must not block saving EDD.
     if (mounted) setState(() {});
+    unawaited(BabyNotificationService.instance.reschedule().catchError((Object error) {
+      debugPrint('Notification scheduling failed: $error');
+    }));
   }
   @override Widget build(BuildContext context) {
     if (loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -114,54 +123,96 @@ class BabyNotificationService {
   static final instance = BabyNotificationService._();
   final FlutterLocalNotificationsPlugin plugin = FlutterLocalNotificationsPlugin();
   bool initialized = false;
+
   Future<void> initialize() async {
     if (initialized) return;
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     await plugin.initialize(const InitializationSettings(android: android));
     initialized = true;
-    await plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();
   }
+
+  Future<bool> requestPermission() async {
+    await initialize();
+    return await plugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission() ?? true;
+  }
+
+  Future<void> testNotification() async {
+    await initialize();
+    final allowed = await requestPermission();
+    if (!allowed) throw StateError('Notification permission denied');
+    await plugin.show(
+      987654,
+      'হবু বাবা — টেস্ট নোটিফিকেশন',
+      'নোটিফিকেশন চালু আছে। প্রতি ঘণ্টায় নতুন পরামর্শ আসবে।',
+      const NotificationDetails(android: AndroidNotificationDetails(
+        'parenting_tips_hourly_v2', 'Hourly parenting tips',
+        channelDescription: 'Baby, mother and father care reminders',
+        importance: Importance.high, priority: Priority.high,
+      )),
+    );
+  }
+
   Future<void> reschedule() async {
-    if (!initialized) await initialize();
-    await plugin.cancelAll();
+    await initialize();
     final prefs = await SharedPreferences.getInstance();
+    await plugin.cancelAll();
     if (!(prefs.getBool('notifications_enabled') ?? true)) return;
+    if (!await requestPermission()) return;
     final mode = prefs.getString('baby_mode') ?? 'pregnancy';
     final date = DateTime.tryParse(prefs.getString('baby_date') ?? '');
     if (date == null) return;
-    final content = jsonDecode(await rootBundle.loadString('assets/data/rotating_tips.json')) as List<dynamic>;
-    final now = DateTime.now();
-    final categories = <String, List<Map<String, dynamic>>>{};
+
+    final content = jsonDecode(
+      await rootBundle.loadString('assets/data/rotating_tips.json'),
+    ) as List<dynamic>;
+    final allTips = <Map<String, dynamic>>[];
     for (final item in content) {
-      final m = Map<String,dynamic>.from(item as Map);
-      if (m['mode'] != 'both' && m['mode'] != mode) continue;
-      (categories[m['category'] as String] ??= []).add(m);
+      final m = Map<String, dynamic>.from(item as Map);
+      if (m['mode'] == 'both' || m['mode'] == mode) allTips.add(m);
     }
-    final keys = categories.keys.toList()..sort();
-    if (keys.isEmpty) return;
-    final count = (prefs.getInt('notifications_per_day') ?? 3).clamp(1, 3);
-    final hours = count == 1 ? <int>[9] : count == 2 ? <int>[9, 20] : <int>[9, 14, 20];
+    if (allTips.isEmpty) return;
+
+    final now = DateTime.now();
+    final everyHour = prefs.getBool('notifications_hourly') ?? true;
+    // 14 days x 24 = 336 notifications. Android plugin enforces limits
+    // on some devices; refresh these slots every time the app is opened.
+    final hours = everyHour ? List<int>.generate(24, (i) => i)
+        : <int>[9, 14, 20];
+    var notificationId = 1000;
+    var tipIndex = prefs.getInt('notification_rotation_index') ?? 0;
     final today = DateUtils.dateOnly(now);
-    // Local platform scheduling is finite: refresh future slots whenever app opens.
     for (var day = 0; day < 14; day++) {
-      for (var slot = 0; slot < hours.length; slot++) {
-        final target = today.add(Duration(days: day, hours: hours[slot]));
-        if (!target.isAfter(now)) continue;
-        final ci = (today.difference(DateTime(2026, 1, 1)).inDays + day * hours.length + slot).abs() % keys.length;
-        final pool = categories[keys[ci]]!;
-        final index = ((day * 3 + slot) ~/ keys.length) % pool.length;
-        final tip = pool[index];
-        final days = today.add(Duration(days: day)).difference(DateUtils.dateOnly(date)).inDays;
-        final gestDays = 280 - date.difference(today.add(Duration(days: day))).inDays;
-        if (mode == 'born' && days < 0) continue;
-        if (mode == 'pregnancy' && gestDays < 0) continue;
-        final body = (tip['message'] as String).replaceAll('{age}', mode == 'born' ? '$days দিন' : '${gestDays ~/ 7} সপ্তাহ');
-        await plugin.zonedSchedule(day * 3 + slot + 100, tip['title'] as String, body,
+      final dayDate = today.add(Duration(days: day));
+      final ageDays = dayDate.difference(DateUtils.dateOnly(date)).inDays;
+      final gestDays = 280 - DateUtils.dateOnly(date).difference(dayDate).inDays;
+      if (mode == 'born' && ageDays < 0) continue;
+      if (mode == 'pregnancy' && (gestDays < 0 || gestDays > 294)) continue;
+      for (final hour in hours) {
+        final target = DateTime(dayDate.year, dayDate.month, dayDate.day, hour);
+        if (!target.isAfter(now.add(const Duration(minutes: 1)))) continue;
+        final tip = allTips[tipIndex % allTips.length];
+        tipIndex++;
+        final age = mode == 'born'
+            ? '$ageDays দিন'
+            : '${gestDays ~/ 7} সপ্তাহ ${gestDays % 7} দিন';
+        final body = (tip['message'] as String)
+            .replaceAll('{age}', age).replaceAll('\${age}', age);
+        await plugin.zonedSchedule(
+          notificationId++, tip['title'] as String, body,
           tzloc.TZDateTime.from(target.toUtc(), tzloc.UTC),
-          const NotificationDetails(android: AndroidNotificationDetails('parenting_tips_v1','Daily parenting tips',channelDescription:'Pregnancy and parenting care', importance: Importance.defaultImportance, priority: Priority.defaultPriority)),
-          androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle);
+          const NotificationDetails(android: AndroidNotificationDetails(
+            'parenting_tips_hourly_v2', 'Hourly parenting tips',
+            channelDescription: 'Baby, mother and father care reminders',
+            importance: Importance.high, priority: Priority.high,
+          )),
+          androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        );
       }
     }
+    // On the next open, start content rotation from a fresh place.
+    await prefs.setInt('notification_rotation_index', tipIndex % allTips.length);
   }
 }
 
@@ -170,19 +221,112 @@ class ProfileSettingsScreen extends StatefulWidget {
   @override State<ProfileSettingsScreen> createState() => _ProfileSettingsScreenState();
 }
 class _ProfileSettingsScreenState extends State<ProfileSettingsScreen> {
-  String mode = 'pregnancy'; DateTime? date; bool enabled = true; int count = 3;
-  @override void initState() { super.initState(); _load(); }
-  Future<void> _load() async {final p = await SharedPreferences.getInstance(); if(mounted) setState(() {mode=p.getString('baby_mode')??'pregnancy'; date=DateTime.tryParse(p.getString('baby_date')??''); enabled=p.getBool('notifications_enabled')??true; count=p.getInt('notifications_per_day')??3;});}
-  Future<void> _datePick() async {final now=DateTime.now();final value=await showDatePicker(context: context, initialDate: date??now, firstDate: DateTime(2020),lastDate: now.add(const Duration(days: 320)));if(value!=null)setState(()=>date=value);}
-  Future<void> _save() async { if(date==null)return;final p=await SharedPreferences.getInstance();await p.setString('baby_mode',mode);await p.setString('baby_date',date!.toIso8601String());await p.setBool('notifications_enabled',enabled);await p.setInt('notifications_per_day',count);await BabyNotificationService.instance.reschedule();if(mounted){ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('সংরক্ষিত হয়েছে')));Navigator.pop(context, true);}}
-  @override Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: const Text('প্রোফাইল ও নোটিফিকেশন')),body: ListView(padding: const EdgeInsets.all(16),children:[
-    DropdownButtonFormField<String>(value: mode, decoration: const InputDecoration(labelText:'মোড'),items: const [DropdownMenuItem(value:'pregnancy',child:Text('গর্ভাবস্থা')),DropdownMenuItem(value:'born',child:Text('বাবু জন্মেছে'))],onChanged:(v)=>setState(()=>mode=v??mode)),
-    ListTile(title:Text(date==null?'তারিখ দিন':'${date!.day}/${date!.month}/${date!.year}'),subtitle:Text(mode=='born'?'জন্মতারিখ (DOB)':'সম্ভাব্য প্রসবের তারিখ (EDD)'),trailing:const Icon(Icons.edit_calendar),onTap:_datePick),
-    SwitchListTile(title:const Text('Daily Notifications'),value:enabled,onChanged:(v)=>setState(()=>enabled=v)),
-    DropdownButtonFormField<int>(value:count, decoration:const InputDecoration(labelText:'প্রতিদিন কয়টি নোটিফিকেশন'),items:[1,2,3].map((n)=>DropdownMenuItem(value:n,child:Text('$n টি'))).toList(),onChanged:(v)=>setState(()=>count=v??3)),
-    const SizedBox(height:20),FilledButton(onPressed:_save,child:const Text('পরিবর্তন সংরক্ষণ')),
-    const SizedBox(height:12),const Text('নোটিফিকেশন ফোনের অনুমতি ও battery settings-এর ওপর নির্ভরশীল। চিকিৎসার জরুরি রিমাইন্ডারের বিকল্প নয়।')
-  ]));
+  String mode = 'pregnancy';
+  DateTime? date;
+  bool enabled = true;
+  bool hourly = true;
+  bool saving = false;
+
+  @override
+  void initState() { super.initState(); _load(); }
+
+  Future<void> _load() async {
+    final p = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      mode = p.getString('baby_mode') ?? 'pregnancy';
+      date = DateTime.tryParse(p.getString('baby_date') ?? '');
+      enabled = p.getBool('notifications_enabled') ?? true;
+      hourly = p.getBool('notifications_hourly') ?? true;
+    });
+  }
+
+  Future<void> _datePick() async {
+    final now = DateTime.now();
+    final value = await showDatePicker(
+      context: context,
+      initialDate: date ?? now,
+      firstDate: DateTime(2020),
+      lastDate: now.add(const Duration(days: 320)),
+    );
+    if (value != null) setState(() => date = value);
+  }
+
+  Future<void> _save() async {
+    if (date == null || saving) return;
+    setState(() => saving = true);
+    final p = await SharedPreferences.getInstance();
+    await p.setString('baby_mode', mode);
+    await p.setString('baby_date', date!.toIso8601String());
+    await p.setBool('notifications_enabled', enabled);
+    await p.setBool('notifications_hourly', hourly);
+    if (!mounted) return;
+    // Do not block saving the profile while Android schedules notifications.
+    Navigator.pop(context, true);
+    unawaited(BabyNotificationService.instance.reschedule().catchError((Object error) {
+      debugPrint('Notification scheduling failed: $error');
+    }));
+  }
+
+  Future<void> _test() async {
+    try {
+      await BabyNotificationService.instance.testNotification();
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('টেস্ট নোটিফিকেশন পাঠানো হয়েছে।')));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('নোটিফিকেশন চালু হয়নি: $error'),
+      ));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('প্রোফাইল ও নোটিফিকেশন')),
+    body: ListView(padding: const EdgeInsets.all(16), children: [
+      DropdownButtonFormField<String>(
+        initialValue: mode,
+        decoration: const InputDecoration(labelText: 'মোড'),
+        items: const [
+          DropdownMenuItem(value: 'pregnancy', child: Text('গর্ভাবস্থা')),
+          DropdownMenuItem(value: 'born', child: Text('বাবু জন্মেছে')),
+        ],
+        onChanged: (v) => setState(() => mode = v ?? mode),
+      ),
+      ListTile(
+        title: Text(date == null ? 'তারিখ দিন' : '${date!.day}/${date!.month}/${date!.year}'),
+        subtitle: Text(mode == 'born' ? 'জন্মতারিখ (DOB)' : 'সম্ভাব্য প্রসবের তারিখ (EDD)'),
+        trailing: const Icon(Icons.edit_calendar),
+        onTap: _datePick,
+      ),
+      SwitchListTile(
+        title: const Text('Notification চালু'), value: enabled,
+        onChanged: (v) => setState(() => enabled = v),
+      ),
+      SwitchListTile(
+        title: const Text('প্রতি ঘণ্টায় Notification'),
+        subtitle: const Text('দিন-রাত প্রতি ঘণ্টায়; বন্ধ করলে দিনে ৩ বার'),
+        value: hourly,
+        onChanged: (v) => setState(() => hourly = v),
+      ),
+      const SizedBox(height: 16),
+      FilledButton(
+        onPressed: saving ? null : _save,
+        child: Text(saving ? 'সংরক্ষণ হচ্ছে...' : 'পরিবর্তন সংরক্ষণ'),
+      ),
+      const SizedBox(height: 12),
+      OutlinedButton.icon(
+        onPressed: _test,
+        icon: const Icon(Icons.notifications_active),
+        label: const Text('এখনই Test Notification পাঠাও'),
+      ),
+      const SizedBox(height: 12),
+      const Text('Android Settings থেকে Notifications Allow করতে হবে। '
+          'Battery restrictions থাকলে সময় দেরি হতে পারে। '
+          'আগামী ১৪ দিনের notification schedule হয়; '
+          'অ্যাপ খুললে পরবর্তী ১৪ দিন আবার schedule হবে।'),
+    ]),
+  );
 }
 
 class MainNavigationScreen extends StatefulWidget {
@@ -730,7 +874,7 @@ class _AIChatScreenState extends State<AIChatScreen> {
   final List<Map<String, dynamic>> _messages = [];
   bool _isLoading = false;
   static const _keyStore = FlutterSecureStorage();
-  static const _geminiModel = 'gemini-2.5-flash';
+  static const _geminiModel = 'gemini-3.5-flash-lite';
   String _geminiKey = '';
   bool _keyLoading = true;
   final String _systemInstruction = '''
@@ -853,6 +997,7 @@ class _AIChatScreenState extends State<AIChatScreen> {
         if (result.statusCode != 200) {
           if (result.statusCode == 400 || result.statusCode == 403) throw Exception('API Key বা API access যাচাই করুন (${result.statusCode})');
           if (result.statusCode == 429) throw Exception('Free Tier limit শেষ হয়েছে। পরে চেষ্টা করুন।');
+          if (result.statusCode == 404) throw Exception('এই API Key-তে $_geminiModel মডেলটি পাওয়া যাচ্ছে না (404)। Google AI Studio-তে মডেলের অ্যাক্সেস পরীক্ষা করুন।');
           throw Exception('Gemini সাড়া দেয়নি (${result.statusCode})');
         }
         final parsed = jsonDecode(utf8.decode(result.bodyBytes)) as Map<String, dynamic>;
